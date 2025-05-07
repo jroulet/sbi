@@ -43,6 +43,7 @@ dependencies = [
     "torch>=1.13.0, <2.6.0",
     "tqdm",
     "pymc>=5.0.0",
+    "xgboost",
     "zuko>=1.2.0",
 ]
 

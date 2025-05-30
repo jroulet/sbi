@@ -40,7 +40,7 @@ dependencies = [
     "scikit-learn",
     "scipy",
     "tensorboard",
-    "torch>=1.13.0, <2.6.0",
+    "torch",
     "tqdm",
     "pymc>=5.0.0",
     "xgboost",

@@ -9,6 +9,8 @@ from torch import Tensor
 from torch.distributions import Distribution
 import numpy as np
 
+from scipy.optimize import differential_evolution
+
 import sbi.utils as utils
 from sbi.inference.posteriors import DirectPosterior
 from sbi.inference.trainers.npe.npe_base import PosteriorEstimator
@@ -24,7 +26,10 @@ class NPE_D(PosteriorEstimator):
     @functools.wraps(NPE_B.__init__)
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._log_proposal_to_prior_ratio_regressor = xgboost.XGBRegressor()
+        self._a = None
+        self._b = None
+        self._log_proposal_to_prior_ratio_mu = xgboost.XGBRegressor()
+        self._log_proposal_to_prior_ratio_sigma = xgboost.XGBRegressor()
 
     def _log_prob_proposal_posterior(
         self,
@@ -53,7 +58,7 @@ class NPE_D(PosteriorEstimator):
             masks=masks,
             proposal=proposal,
         )
-        softening = self._predict_proposal_to_prior_ratio(x)
+        softening = self._get_softening(x)
         return softening * importance_weighted_log_prob
 
     def append_simulations(
@@ -85,37 +90,52 @@ class NPE_D(PosteriorEstimator):
 
         self._round = max(self._data_round_index)
         log_proposal_to_prior_ratio = -self._get_log_importance_weights(
-            theta
-        ).cpu().numpy()
+            theta).cpu().numpy()
         x = x.cpu().numpy()
-        self._log_proposal_to_prior_ratio_regressor.fit(
+        self._log_proposal_to_prior_ratio_mu.fit(
             x, log_proposal_to_prior_ratio)
+        mu = self._log_proposal_to_prior_ratio_mu.predict(x)
+        self._log_proposal_to_prior_ratio_sigma.fit(
+            x, np.sqrt(np.abs(log_proposal_to_prior_ratio**2 - mu**2)))
+        sigma = self._log_proposal_to_prior_ratio_sigma.predict(x)
 
-        # Print effective / total number of samples with & without regressor
-        weights_no_regressor = np.exp(
-            log_proposal_to_prior_ratio - log_proposal_to_prior_ratio.max()
-        )
-        n_effective_no_regressor = (
-            weights_no_regressor.sum()**2 / (weights_no_regressor**2).sum()
-        )
-        efficiency_no_regressor = n_effective_no_regressor / theta.size(0)
+        def _reweighting_efficiency(a, b, mu, sigma,
+                                    log_proposal_to_prior_ratio):
+            log_proposal_to_prior_ratio_pred = a * mu + b * sigma
+            weights = np.exp(
+                log_proposal_to_prior_ratio - log_proposal_to_prior_ratio_pred)
+            n_effective = weights.sum()**2 / (weights**2).sum()
+            efficiency = n_effective / len(weights)
+            return efficiency
 
-        predicted = self._log_proposal_to_prior_ratio_regressor.predict(x)
-        weights = np.exp(1.5*predicted - log_proposal_to_prior_ratio)
-        n_effective = weights.sum()**2 / (weights**2).sum()
-        efficiency = n_effective / theta.size(0)
+        result = differential_evolution(
+            lambda y, *args: - _reweighting_efficiency(*y, *args),
+            bounds=[(0, 2), (0, 4)],
+            args=(mu, sigma, log_proposal_to_prior_ratio))
+        a, b = result.x
+        self._a = a
+        self._b = b
+        
+        # # Print effective / total number of samples with & without regressor
+        # weights_no_regressor = np.exp(
+        #     log_proposal_to_prior_ratio - log_proposal_to_prior_ratio.max()
+        # )
+        # n_effective_no_regressor = (
+        #     weights_no_regressor.sum()**2 / (weights_no_regressor**2).sum()
+        # )
+        # efficiency_no_regressor = n_effective_no_regressor / theta.size(0)
 
-        print(
-            "Trained regressor for log proposal-to-prior ratio.\n"
-            "Effective / total sample size: "
-            f"{n_effective:.1f} / {theta.size(0)} "
-            f"({efficiency:.2%})\n"
-            "[Without the regressor it would have been: "
-            f"{n_effective_no_regressor:.1f} / {theta.size(0)} "
-            f"({efficiency_no_regressor:.2%})]"
-        )
+        # print(
+        #     "Trained regressor for log proposal-to-prior ratio.\n"
+        #     "Effective / total sample size: "
+        #     f"{n_effective:.1f} / {theta.size(0)} "
+        #     f"({efficiency:.2%})\n"
+        #     "[Without the regressor it would have been: "
+        #     f"{n_effective_no_regressor:.1f} / {theta.size(0)} "
+        #     f"({efficiency_no_regressor:.2%})]"
+        # )
 
-    def _predict_proposal_to_prior_ratio(self, x: Tensor) -> Tensor:
+    def _get_softening(self, x: Tensor) -> Tensor:
         """
         Predict proposal-to-prior ratio for x.
 
@@ -126,11 +146,13 @@ class NPE_D(PosteriorEstimator):
             proposal-to-prior ratio.
         """
         x = x.cpu().numpy()
-        predicted_log_proposal_to_prior_ratio = torch.tensor(
-            self._log_proposal_to_prior_ratio_regressor.predict(x),
-            device=x.device
-        )
-        return torch.exp(predicted_log_proposal_to_prior_ratio)
+
+        mu = self._log_proposal_to_prior_ratio_mu.predict(x)
+        sigma = self._log_proposal_to_prior_ratio_sigma.predict(x)
+
+        log_softening = torch.tensor(self._a * mu + self._b * sigma,
+                                     device=x.device)
+        return torch.exp(log_softening)
 
     def _get_log_importance_weights(self, theta):
         """Return log(proposal/prior)."""

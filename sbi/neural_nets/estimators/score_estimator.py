@@ -176,6 +176,7 @@ class ConditionalScoreEstimator(ConditionalVectorFieldEstimator):
         self,
         input: Tensor,
         condition: Tensor,
+        weightratios: Tensor,
         times: Optional[Tensor] = None,
         control_variate=True,
         control_variate_threshold=torch.inf,
@@ -227,7 +228,7 @@ class ConditionalScoreEstimator(ConditionalVectorFieldEstimator):
         weights = self.weight_fn(times)
 
         # Compute MSE loss between network output and true score.
-        loss = torch.sum((score_pred - score_target) ** 2.0, dim=-1)
+        loss = weightratios * torch.sum((score_pred - score_target) ** 2.0, dim=-1)
 
         # For times -> 0 this loss has high variance a standard method to reduce the
         # variance is to use a control variate i.e. a term that has zero expectation but
@@ -361,16 +362,11 @@ class ConditionalScoreEstimator(ConditionalVectorFieldEstimator):
                 - a custom function that returns a Callable.
         """
         if weight_fn == "identity":
-            self.weight_fn = lambda times: 1
+            self.weight_fn = self._identity_weight_fn
         elif weight_fn == "max_likelihood":
-            self.weight_fn = (
-                lambda times: self.diffusion_fn(
-                    torch.ones((1,), device=times.device), times
-                )
-                ** 2
-            )
+            self.weight_fn = self._max_likelihood_weight_fn
         elif weight_fn == "variance":
-            self.weight_fn = lambda times: self.std_fn(times) ** 2
+            self.weight_fn = self._variance_weight_fn
         elif callable(weight_fn):
             self.weight_fn = weight_fn
         else:
@@ -395,6 +391,19 @@ class ConditionalScoreEstimator(ConditionalVectorFieldEstimator):
         v = f - 0.5 * g**2 * score
         return v
 
+    @staticmethod
+    def _identity_weight_fn(times):
+        return 1
+
+    def _max_likelihood_weight_fn(self, times):
+        return (
+            self.diffusion_fn(
+                torch.ones((1,), device=times.device), times
+            )** 2
+        )
+
+    def _variance_weight_fn(self, times):
+        return self.std_fn(times) ** 2
 
 class VPScoreEstimator(ConditionalScoreEstimator):
     """Class for score estimators with variance preserving SDEs (i.e., DDPM)."""

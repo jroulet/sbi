@@ -4,7 +4,8 @@
 import time
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from typing import Any, Callable, Optional, Protocol, Union
+import numpy as np
+from typing import Any, Callable, Optional, Protocol, Union, Tuple
 
 import torch
 from torch import Tensor, ones
@@ -30,6 +31,7 @@ from sbi.utils import (
 )
 from sbi.utils.sbiutils import ImproperEmpirical, mask_sims_from_prior
 from sbi.utils.torchutils import assert_all_finite
+from sbi.utils.sbiutils import get_simulations_since_round
 
 
 class VectorFieldEstimatorBuilder(Protocol):
@@ -107,10 +109,66 @@ class VectorFieldInference(NeuralInference, ABC):
             self._build_neural_net = vector_field_estimator_builder
 
         self._proposal_roundwise = []
+        self._weights_roundwise = []
 
     @abstractmethod
     def _build_default_nn_fn(self, **kwargs) -> VectorFieldEstimatorBuilder:
         pass
+
+    def get_simulations(
+        self,
+        starting_round: int = 0,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        r"""Returns all $\theta$, $x$, prior_masks and weights from
+        rounds >= `starting_round`.
+
+        If requested, do not return invalid data.
+
+        Args:
+            starting_round: The earliest round to return samples from
+            (we start counting from zero).
+            warn_on_invalid: Whether to give out a warning if invalid
+            simulations were found.
+
+        Returns: Parameters, simulation outputs, prior masks and weights.
+        """
+        theta, x, prior_masks = super().get_simulations(starting_round)
+        weights = get_simulations_since_round(
+            self._weights_roundwise, self._data_round_index, starting_round
+        )
+
+        return theta, x, prior_masks, weights
+    
+    def get_dataloaders(self,
+                        starting_round: int = 0,
+                        training_batch_size: int = 200,
+                        validation_fraction: float = 0.1,
+                        resume_training=None,
+                        dataloader_kwargs=None):
+        """Return dataloaders for training and validation."""
+        if dataloader_kwargs:
+            print(f'Ignoring `{dataloader_kwargs=}`')
+
+        dataset = torch.utils.data.TensorDataset(
+            *self.get_simulations(starting_round))
+
+        if not resume_training:
+            # These allow to preserve the exact partition into batches
+            # as well as training/validation over multiple trainings.
+            self._train_ind_batches, self._val_ind_batches \
+                = get_train_val_batch_inds(len(dataset), training_batch_size,
+                                           validation_fraction)
+
+            # Other methods assume this attribute exists
+            self.train_indices = np.concatenate(self._train_ind_batches)
+
+        train_batches = [dataset[inds] for inds in self._train_ind_batches]
+        val_batches = [dataset[inds] for inds in self._val_ind_batches]
+
+        train_loader = FixedBatchesDataLoader(train_batches)
+        val_loader = FixedBatchesDataLoader(val_batches)
+
+        return train_loader, val_loader
 
     def append_simulations(
         self,
@@ -119,6 +177,7 @@ class VectorFieldInference(NeuralInference, ABC):
         proposal: Optional[DirectPosterior] = None,
         exclude_invalid_x: Optional[bool] = None,
         data_device: Optional[str] = None,
+        weights= None,
     ) -> "VectorFieldInference":
         r"""Store parameters and simulation outputs to use them for later training.
 
@@ -169,8 +228,12 @@ class VectorFieldInference(NeuralInference, ABC):
             x, exclude_invalid_x=exclude_invalid_x
         )
 
+        if weights is None:
+            weights = torch.ones(len(theta))
+
         x = x[is_valid_x]
         theta = theta[is_valid_x]
+        weights = weights[is_valid_x]
 
         # Check for problematic z-scoring
         warn_if_zscoring_changes_data(x)
@@ -188,6 +251,7 @@ class VectorFieldInference(NeuralInference, ABC):
         self._theta_roundwise.append(theta)
         self._x_roundwise.append(x)
         self._prior_masks.append(prior_masks)
+        self._weights_roundwise.append(weights)
 
         self._proposal_roundwise.append(proposal)
 
@@ -216,6 +280,7 @@ class VectorFieldInference(NeuralInference, ABC):
         retrain_from_scratch: bool = False,
         show_train_summary: bool = False,
         dataloader_kwargs: Optional[dict] = None,
+        lr_scheduler_kwargs=None
     ) -> ConditionalVectorFieldEstimator:
         r"""Returns a vector field estimator that approximates the posterior
         $p(\theta|x)$ through a continuous transformation from the base distribution
@@ -315,7 +380,7 @@ class VectorFieldInference(NeuralInference, ABC):
         # arguments, which will build the neural network.
         if self._neural_net is None or retrain_from_scratch:
             # Get theta,x to initialize NN
-            theta, x, _ = self.get_simulations(starting_round=start_idx)
+            theta, x, _, weights = self.get_simulations(starting_round=start_idx)
             # Use only training data for building the neural net (z-scoring transforms)
 
             self._neural_net = self._build_neural_net(
@@ -329,7 +394,7 @@ class VectorFieldInference(NeuralInference, ABC):
                 x.to("cpu"),
             )
 
-            del theta, x
+            del theta, x, weights
 
         # Move entire net to device for training.
         self._neural_net.to(self._device)
@@ -357,10 +422,11 @@ class VectorFieldInference(NeuralInference, ABC):
             for batch in train_loader:
                 self.optimizer.zero_grad()
                 # Get batches on current device.
-                theta_batch, x_batch, masks_batch = (
+                theta_batch, x_batch, masks_batch, weights_batch = (
                     batch[0].to(self._device),
                     batch[1].to(self._device),
                     batch[2].to(self._device),
+                    batch[3].to(self._device),
                 )
 
                 train_losses = self._loss(
@@ -370,6 +436,7 @@ class VectorFieldInference(NeuralInference, ABC):
                     proposal=proposal,
                     calibration_kernel=calibration_kernel,
                     force_first_round_loss=force_first_round_loss,
+                    weights=weights_batch,
                 )
 
                 train_loss = torch.mean(train_losses)
@@ -406,10 +473,11 @@ class VectorFieldInference(NeuralInference, ABC):
 
             with torch.no_grad():
                 for batch in val_loader:
-                    theta_batch, x_batch, masks_batch = (
+                    theta_batch, x_batch, masks_batch, weights_batch = (
                         batch[0].to(self._device),
                         batch[1].to(self._device),
                         batch[2].to(self._device),
+                        batch[3].to(self._device),
                     )
 
                     # For validation loss, we evaluate at a fixed set of times to reduce
@@ -425,6 +493,9 @@ class VectorFieldInference(NeuralInference, ABC):
                     masks_batch = masks_batch.repeat(
                         times_batch, *([1] * (masks_batch.ndim - 1))
                     )
+                    weights_batch = weights_batch.repeat(
+                        times_batch, *([1] * (weights_batch.ndim - 1))
+                    )
 
                     validation_times_rep = validation_times.repeat_interleave(
                         val_batch_size, dim=0
@@ -439,6 +510,7 @@ class VectorFieldInference(NeuralInference, ABC):
                         calibration_kernel=calibration_kernel,
                         times=validation_times_rep,
                         force_first_round_loss=force_first_round_loss,
+                        weights=weights_batch,
                     )
 
                     val_loss_sum += val_losses.sum().item()
@@ -550,6 +622,7 @@ class VectorFieldInference(NeuralInference, ABC):
         x: Tensor,
         masks: Tensor,
         proposal: Optional[Any],
+        weights = None
     ) -> Tensor:
         cls_name = self.__class__.__name__
         raise NotImplementedError(f"Multi-round {cls_name} is not yet implemented.")
@@ -563,6 +636,7 @@ class VectorFieldInference(NeuralInference, ABC):
         calibration_kernel: Callable,
         times: Optional[Tensor] = None,
         force_first_round_loss: bool = False,
+        weights = None,
     ) -> Tensor:
         r"""Return loss from vector field estimator. Currently only single-round
         training is implemented, i.e., no proposal correction is applied for later
@@ -592,7 +666,7 @@ class VectorFieldInference(NeuralInference, ABC):
         cls_name = self.__class__.__name__
         if self._round == 0 or force_first_round_loss:
             # First round loss.
-            loss = self._neural_net.loss(theta, x, times=times)
+            loss = self._neural_net.loss(theta, x, weights, times=times)
         else:
             raise NotImplementedError(
                 f"Multi-round {cls_name} with arbitrary proposals is not implemented"
@@ -600,3 +674,56 @@ class VectorFieldInference(NeuralInference, ABC):
 
         assert_all_finite(loss, f"{cls_name} loss")
         return calibration_kernel(x) * loss
+    
+def get_train_val_batch_inds(num_simulations, training_batch_size,
+                             validation_fraction):
+    """
+    Returns
+    -------
+    train_ind_batches, val_ind_batches : list of int arrays
+        Indices of the training and validation simulations, arranged in
+        batches.
+    """
+    num_batches = num_simulations // training_batch_size
+    batch_indices = np.split(np.arange(num_batches * training_batch_size),
+                             num_batches)
+
+    num_training_batches = int(
+        len(batch_indices) * (1-validation_fraction))
+    train_ind_batches = batch_indices[:num_training_batches]
+    val_ind_batches = batch_indices[num_training_batches:]
+    return train_ind_batches, val_ind_batches
+
+class FixedBatchesDataLoader:
+    """A list of batches, always the same."""
+    def __init__(self, batches, shuffle_batches=True):
+        """
+        Parameters
+        ----------
+        batches : list of lists of torch.Tensor
+            Each batch contains multiple tensors, e.g. data and
+            parameters.
+
+        shuffle_batches : bool
+            Whether to iterate over the batches in random order every
+            time.
+        """
+        if len(set(map(len, batches))) != 1:
+            raise ValueError('Batches are not the same size.')
+
+        self.batches = batches
+        self.shuffle_batches = shuffle_batches
+
+        self.batch_size = len(batches[0][0])
+        self._rng = np.random.default_rng()
+
+    def __len__(self):
+        return len(self.batches)
+
+    def __iter__(self):
+        order = np.arange(len(self.batches))
+        if self.shuffle_batches:
+            self._rng.shuffle(order)
+
+        for i in order:
+            yield self.batches[i]

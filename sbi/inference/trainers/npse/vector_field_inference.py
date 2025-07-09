@@ -233,7 +233,7 @@ class VectorFieldInference(NeuralInference, ABC):
 
         x = x[is_valid_x]
         theta = theta[is_valid_x]
-        weights = weights[is_valid_x]
+        #weights = weights[is_valid_x]
 
         # Check for problematic z-scoring
         warn_if_zscoring_changes_data(x)

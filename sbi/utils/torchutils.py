@@ -52,8 +52,6 @@ def process_device(device: Union[str, torch.device]) -> str:
         # Else, check whether the custom device is valid.
         else:
             check_device(device)
-            if isinstance(device, torch.device):
-                device = device.type
 
         return device
 

@@ -40,6 +40,7 @@ dependencies = [
     "tensorboard",
     "torch>=1.13.0",
     "tqdm",
+    "xgboost",
     "zuko>=1.2.0",
 ]
 
